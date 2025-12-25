@@ -1,0 +1,7 @@
+{
+  "name": "Language Live Translate",
+  "description": "A high-performance translation app supporting text and real-time voice conversations across Japanese, Korean, Chinese, French, Italian, Urdu, and English using Gemini 2.5 Live API.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
