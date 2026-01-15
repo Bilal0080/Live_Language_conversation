@@ -18,8 +18,11 @@ const LiveVoiceTranslator: React.FC = () => {
   const [transcriptions, setTranscriptions] = useState<Array<{ role: 'user' | 'model'; text: string }>>([]);
   const [isConnecting, setIsConnecting] = useState(false);
   const [visualizerData, setVisualizerData] = useState<number[]>(new Array(40).fill(5));
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ message: string; type: 'permission' | 'network' | 'api' | 'unknown'; details?: string } | null>(null);
   
+  // Track if we are viewing a past session
+  const [viewingHistoryItem, setViewingHistoryItem] = useState<VoiceHistoryItem | null>(null);
+
   const [sourceLanguage, setSourceLanguage] = useState<Language>(() => {
     return (localStorage.getItem('lingua_voice_source') as Language) || 'English';
   });
@@ -96,20 +99,48 @@ const LiveVoiceTranslator: React.FC = () => {
     };
   }, []);
 
+  /**
+   * Generates a concise summary of the conversation using Gemini API
+   */
+  const generateConversationSummary = async (id: string, msgs: Array<{ role: 'user' | 'model'; text: string }>) => {
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const transcript = msgs.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`).join('\n');
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: `Please summarize this translated conversation in exactly one short, descriptive sentence (maximum 12 words). Focus on the main topic discussed. The conversation was between ${sourceLanguage} and ${targetLanguage}.\n\nTranscript:\n${transcript}`,
+      });
+
+      const summary = response.text?.trim();
+      if (summary) {
+        setHistory(prev => prev.map(item => item.id === id ? { ...item, summary } : item));
+      }
+    } catch (e) {
+      console.error('Failed to generate conversation summary:', e);
+      setHistory(prev => prev.map(item => {
+        if (item.id === id && item.summary === 'Summarizing conversation...') {
+          const fallback = msgs[0]?.text.substring(0, 60) + '...';
+          return { ...item, summary: fallback };
+        }
+        return item;
+      }));
+    }
+  };
+
   const saveCurrentSessionToHistory = (msgs: Array<{ role: 'user' | 'model'; text: string }>) => {
     if (msgs.length === 0) return;
     
-    const firstMsg = msgs[0].text;
-    const summary = firstMsg.length > 60 ? firstMsg.substring(0, 60) + '...' : firstMsg;
-
+    const id = crypto.randomUUID();
     const newItem: VoiceHistoryItem = {
-      id: crypto.randomUUID(),
+      id,
       timestamp: Date.now(),
       messages: [...msgs],
-      summary
+      summary: 'Summarizing conversation...' 
     };
 
     setHistory(prev => [newItem, ...prev].slice(0, 30));
+    generateConversationSummary(id, msgs);
   };
 
   const startSession = async () => {
@@ -117,16 +148,41 @@ const LiveVoiceTranslator: React.FC = () => {
     setIsConnecting(true);
     setError(null);
     setTranscriptions([]);
+    setViewingHistoryItem(null); 
     
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-      
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e: any) {
+        if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+          setError({
+            type: 'permission',
+            message: 'Microphone access denied.',
+            details: 'Please enable microphone permissions in your browser settings to use live voice translation.'
+          });
+        } else if (e.name === 'NotFoundError' || e.name === 'DevicesNotFoundError') {
+          setError({
+            type: 'permission',
+            message: 'No microphone found.',
+            details: 'Please ensure a microphone is connected to your device.'
+          });
+        } else {
+          setError({
+            type: 'unknown',
+            message: 'Could not access microphone.',
+            details: e.message
+          });
+        }
+        setIsConnecting(false);
+        return;
+      }
 
+      streamRef.current = stream;
       audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       outputAudioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const systemInstruction = `You are a professional 2-way live translation assistant. The user is currently in a conversation between ${sourceLanguage} and ${targetLanguage}. 
 - When you hear ${sourceLanguage}, translate it into ${targetLanguage} and speak ONLY the translation.
 - When you hear ${targetLanguage}, translate it into ${sourceLanguage} and speak ONLY the translation.
@@ -134,7 +190,7 @@ const LiveVoiceTranslator: React.FC = () => {
 - Do not add conversational filler. Speak naturally and concisely.`;
 
       const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           outputAudioTranscription: {},
@@ -178,10 +234,7 @@ const LiveVoiceTranslator: React.FC = () => {
                 const audioBuffer = await decodeAudioData(decode(audioData), outCtx, 24000, 1);
                 const source = outCtx.createBufferSource();
                 source.buffer = audioBuffer;
-                
-                // Apply speed customization
                 source.playbackRate.value = speechRate;
-                
                 source.connect(outCtx.destination);
                 source.onended = () => {
                   sourcesRef.current.delete(source);
@@ -227,22 +280,37 @@ const LiveVoiceTranslator: React.FC = () => {
               currentTranscriptionRef.current = { user: '', model: '' };
             }
           },
-          onerror: (e) => {
+          onerror: (e: any) => {
             console.error('Live session error:', e);
-            setError(`Session error: ${parseApiError(e)}`);
+            const msg = parseApiError(e);
+            let errorType: 'network' | 'api' | 'unknown' = 'api';
+            
+            if (msg.toLowerCase().includes('network') || msg.toLowerCase().includes('connection') || msg.toLowerCase().includes('fetch')) {
+              errorType = 'network';
+            }
+
+            setError({
+              type: errorType,
+              message: 'Session Interrupted',
+              details: msg
+            });
             stopSession();
           },
           onclose: () => {
-            stopSession();
+            if (isActive) stopSession();
           }
         }
       });
 
       sessionPromiseRef.current = sessionPromise;
 
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to start session:', err);
-      setError(parseApiError(err));
+      setError({
+        type: 'api',
+        message: 'Could not connect to translation service.',
+        details: parseApiError(err)
+      });
       setIsConnecting(false);
       stopSession();
     }
@@ -250,10 +318,8 @@ const LiveVoiceTranslator: React.FC = () => {
 
   const stopSession = () => {
     if (isActive) {
-      setTranscriptions(current => {
-        saveCurrentSessionToHistory(current);
-        return current;
-      });
+      const finalTranscriptions = [...transcriptions];
+      saveCurrentSessionToHistory(finalTranscriptions);
     }
 
     setIsActive(false);
@@ -265,12 +331,12 @@ const LiveVoiceTranslator: React.FC = () => {
     }
     
     if (audioCtxRef.current) {
-      audioCtxRef.current.close();
+      audioCtxRef.current.close().catch(() => {});
       audioCtxRef.current = null;
     }
 
     if (outputAudioCtxRef.current) {
-      outputAudioCtxRef.current.close();
+      outputAudioCtxRef.current.close().catch(() => {});
       outputAudioCtxRef.current = null;
     }
 
@@ -279,7 +345,9 @@ const LiveVoiceTranslator: React.FC = () => {
     });
     sourcesRef.current.clear();
     
-    sessionPromiseRef.current?.then(session => session.close());
+    sessionPromiseRef.current?.then(session => {
+      try { session.close(); } catch(e) {}
+    }).catch(() => {});
     sessionPromiseRef.current = null;
   };
 
@@ -292,17 +360,29 @@ const LiveVoiceTranslator: React.FC = () => {
   const clearVoiceHistory = () => {
     if (window.confirm('Clear all voice transcription history?')) {
       setHistory([]);
+      setViewingHistoryItem(null);
     }
   };
 
   const deleteHistoryItem = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     setHistory(prev => prev.filter(item => item.id !== id));
+    if (viewingHistoryItem?.id === id) {
+      setViewingHistoryItem(null);
+      setTranscriptions([]);
+    }
   };
 
   const selectHistoryItem = (item: VoiceHistoryItem) => {
+    if (isActive) stopSession();
+    setViewingHistoryItem(item);
     setTranscriptions(item.messages);
     setShowHistory(false);
+  };
+
+  const resetToLive = () => {
+    setViewingHistoryItem(null);
+    setTranscriptions([]);
   };
 
   return (
@@ -351,7 +431,6 @@ const LiveVoiceTranslator: React.FC = () => {
         </button>
       </div>
 
-      {/* Voice Settings Panel */}
       {showSettings && (
         <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-xl animate-in slide-in-from-top-2">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -389,103 +468,181 @@ const LiveVoiceTranslator: React.FC = () => {
                   onChange={(e) => setSpeechRate(parseFloat(e.target.value))}
                   className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
                 />
-                <div className="flex justify-between mt-2 text-[10px] text-slate-400 font-bold">
-                  <span>Slow</span>
-                  <span>Normal</span>
-                  <span>Fast</span>
-                </div>
               </div>
-              <p className="text-[10px] text-slate-400 italic">Changing voice settings while a session is active will take effect on the next utterance.</p>
             </div>
           </div>
         </div>
       )}
 
       {error && (
-        <div className="bg-red-50 border border-red-100 p-4 rounded-2xl flex items-start text-red-600 text-sm animate-in slide-in-from-top-2">
-          <i className="fa-solid fa-triangle-exclamation mr-3 mt-0.5 text-red-400"></i>
-          <div className="flex-1">
-            <p className="font-bold mb-0.5">Voice Session Error</p>
-            <p>{error}</p>
+        <div className={`p-4 rounded-2xl border flex items-start text-sm animate-in slide-in-from-top-2 shadow-sm ${
+          error.type === 'permission' ? 'bg-amber-50 border-amber-100 text-amber-800' : 'bg-red-50 border-red-100 text-red-600'
+        }`}>
+          <div className={`mr-3 mt-1 flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${
+            error.type === 'permission' ? 'bg-amber-100 text-amber-500' : 'bg-red-100 text-red-400'
+          }`}>
+            <i className={`fa-solid ${error.type === 'permission' ? 'fa-microphone-slash' : 'fa-triangle-exclamation'}`}></i>
           </div>
-          <button onClick={() => setError(null)} className="ml-2 text-red-400 hover:text-red-600 transition-colors">
-            <i className="fa-solid fa-xmark"></i>
+          <div className="flex-1">
+            <p className="font-bold mb-1">{error.message}</p>
+            <p className="opacity-80 leading-relaxed mb-3">{error.details}</p>
+            
+            <div className="bg-white/50 p-3 rounded-xl border border-slate-200/50 space-y-2">
+              <p className={`text-[11px] font-bold uppercase tracking-wider flex items-center ${error.type === 'permission' ? 'text-amber-600' : 'text-red-600'}`}>
+                <i className="fa-solid fa-lightbulb mr-2"></i>
+                Suggested Fix
+              </p>
+              <ul className="text-xs list-disc list-inside space-y-1 opacity-90">
+                {error.type === 'permission' && (
+                  <>
+                    <li>Check browser address bar for a blocked mic icon</li>
+                    <li>Go to Settings &gt; Privacy &gt; Microphone permissions</li>
+                    <li>Ensure no other app is currently using the microphone</li>
+                  </>
+                )}
+                {error.type === 'network' && (
+                  <>
+                    <li>Check your internet connection stability</li>
+                    <li>If using a VPN, try disabling it temporarily</li>
+                    <li>Ensure your firewall allows WebSocket connections (Port 443)</li>
+                  </>
+                )}
+                {error.type === 'api' && (
+                  <>
+                    <li>Verify your API key is correctly configured</li>
+                    <li>Check if the 'gemini-2.5-flash-native-audio' model is available in your region</li>
+                    <li>Ensure your project has an active billing account linked</li>
+                  </>
+                )}
+                {error.type === 'unknown' && (
+                  <>
+                    <li>Refresh the page and try again</li>
+                    <li>Check for browser console errors for more detail</li>
+                  </>
+                )}
+              </ul>
+            </div>
+
+            {(error.type === 'network' || error.type === 'api') && (
+              <button 
+                onClick={startSession}
+                className={`mt-4 text-xs font-black uppercase tracking-widest px-4 py-2 rounded-lg transition-colors shadow-sm ${
+                  error.type === 'network' ? 'bg-red-100 text-red-700 hover:bg-red-200' : 'bg-red-600 text-white hover:bg-red-700'
+                }`}
+              >
+                Retry Session
+              </button>
+            )}
+          </div>
+          <button onClick={() => setError(null)} className="ml-4 opacity-50 hover:opacity-100 transition-opacity">
+            <i className="fa-solid fa-xmark text-lg"></i>
           </button>
         </div>
       )}
 
-      <div className="bg-slate-900 rounded-3xl p-8 shadow-2xl relative overflow-hidden min-h-[300px] flex flex-col items-center justify-center">
+      <div className={`rounded-3xl p-8 shadow-2xl relative overflow-hidden min-h-[300px] flex flex-col items-center justify-center transition-all duration-500 ${viewingHistoryItem ? 'bg-slate-800' : 'bg-slate-900'}`}>
         <div className="absolute inset-0 opacity-20 pointer-events-none">
-          <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-indigo-500/30 via-transparent to-transparent"></div>
+          <div className={`absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] via-transparent to-transparent ${viewingHistoryItem ? 'from-amber-500/20' : 'from-indigo-500/30'}`}></div>
         </div>
 
         <div className="z-10 flex flex-col items-center space-y-8 w-full">
-          <div className="flex items-end justify-center space-x-1 h-24">
-            {visualizerData.map((val, idx) => (
-              <div 
-                key={idx} 
-                className={`w-1.5 rounded-full transition-all duration-75 ${isActive ? 'bg-indigo-400 shadow-[0_0_10px_rgba(129,140,248,0.5)]' : 'bg-slate-700'}`}
-                style={{ height: `${val}%` }}
-              ></div>
-            ))}
-          </div>
+          {!viewingHistoryItem && (
+            <div className="flex items-end justify-center space-x-1 h-24">
+              {visualizerData.map((val, idx) => (
+                <div 
+                  key={idx} 
+                  className={`w-1.5 rounded-full transition-all duration-75 ${isActive ? 'bg-indigo-400 shadow-[0_0_10px_rgba(129,140,248,0.5)]' : 'bg-slate-700'}`}
+                  style={{ height: `${val}%` }}
+                ></div>
+              ))}
+            </div>
+          )}
 
-          <div className="flex flex-col items-center">
-            {isConnecting ? (
-              <div className="flex flex-col items-center text-white">
-                <i className="fa-solid fa-circle-notch fa-spin text-4xl mb-3 text-indigo-400"></i>
-                <p className="font-medium animate-pulse">Establishing secure link...</p>
+          {viewingHistoryItem && (
+            <div className="text-center space-y-4 animate-in fade-in zoom-in-95">
+              <div className="inline-flex items-center space-x-2 bg-amber-500/10 text-amber-400 px-4 py-2 rounded-full border border-amber-500/20">
+                <i className="fa-solid fa-box-archive text-xs"></i>
+                <span className="text-xs font-black uppercase tracking-widest">History Archive</span>
               </div>
-            ) : isActive ? (
+              <h3 className="text-white font-bold text-lg px-6 italic">"{viewingHistoryItem.summary}"</h3>
+              <p className="text-slate-400 text-xs">{new Date(viewingHistoryItem.timestamp).toLocaleString()}</p>
               <button 
-                onClick={stopSession}
-                className="group relative flex items-center justify-center"
+                onClick={resetToLive}
+                className="mt-4 px-6 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-xl text-xs font-bold transition-all flex items-center space-x-2 mx-auto"
               >
-                <div className="absolute inset-0 bg-red-500/20 blur-2xl rounded-full scale-150 animate-pulse"></div>
-                <div className="w-20 h-20 bg-red-500 rounded-full flex items-center justify-center text-white shadow-lg hover:bg-red-600 transition-all z-10">
-                  <i className="fa-solid fa-stop text-2xl"></i>
-                </div>
-                <span className="absolute -bottom-10 text-white font-bold tracking-widest uppercase text-xs">End Session</span>
+                <i className="fa-solid fa-rotate-left"></i>
+                <span>Back to Live Mode</span>
               </button>
-            ) : (
-              <button 
-                onClick={startSession}
-                className="group relative flex items-center justify-center"
-              >
-                <div className="absolute inset-0 bg-indigo-500/20 blur-2xl rounded-full scale-150 group-hover:bg-indigo-500/40 transition-all"></div>
-                <div className="w-20 h-20 bg-indigo-600 rounded-full flex items-center justify-center text-white shadow-lg hover:bg-indigo-700 hover:scale-105 transition-all z-10">
-                  <i className="fa-solid fa-microphone text-2xl"></i>
+            </div>
+          )}
+
+          {!viewingHistoryItem && (
+            <div className="flex flex-col items-center">
+              {isConnecting ? (
+                <div className="flex flex-col items-center text-white">
+                  <div className="relative w-16 h-16 mb-4">
+                    <div className="absolute inset-0 border-4 border-indigo-500/20 rounded-full"></div>
+                    <div className="absolute inset-0 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+                  </div>
+                  <p className="font-bold tracking-widest uppercase text-[10px] animate-pulse">Establishing secure link...</p>
                 </div>
-                <span className="absolute -bottom-10 text-slate-400 font-bold tracking-widest uppercase text-xs">Start Listening</span>
-              </button>
-            )}
-          </div>
+              ) : isActive ? (
+                <button 
+                  onClick={stopSession}
+                  className="group relative flex items-center justify-center"
+                >
+                  <div className="absolute inset-0 bg-red-500/20 blur-2xl rounded-full scale-150 animate-pulse"></div>
+                  <div className="w-20 h-20 bg-red-50 rounded-full flex items-center justify-center text-white shadow-lg hover:bg-red-600 transition-all z-10">
+                    <i className="fa-solid fa-stop text-2xl text-red-600 group-hover:text-white"></i>
+                  </div>
+                  <span className="absolute -bottom-10 text-white font-bold tracking-widest uppercase text-xs">End Session</span>
+                </button>
+              ) : (
+                <button 
+                  onClick={startSession}
+                  className="group relative flex items-center justify-center"
+                >
+                  <div className="absolute inset-0 bg-indigo-500/20 blur-2xl rounded-full scale-150 group-hover:bg-indigo-500/40 transition-all"></div>
+                  <div className="w-20 h-20 bg-indigo-600 rounded-full flex items-center justify-center text-white shadow-lg hover:bg-indigo-700 hover:scale-105 transition-all z-10">
+                    <i className="fa-solid fa-microphone text-2xl"></i>
+                  </div>
+                  <span className="absolute -bottom-10 text-slate-400 font-bold tracking-widest uppercase text-xs">Start Listening</span>
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
       <div className="bg-white rounded-2xl shadow-lg border border-slate-200 flex-1 overflow-hidden flex flex-col min-h-[400px]">
-        <div className="p-4 bg-slate-50 border-b flex items-center justify-between">
+        <div className={`p-4 border-b flex items-center justify-between ${viewingHistoryItem ? 'bg-amber-50/50' : 'bg-slate-50'}`}>
           <h3 className="font-bold text-slate-700 flex items-center">
-            <i className="fa-solid fa-comment-dots text-indigo-500 mr-2"></i>
-            Live Transcription
+            <i className={`fa-solid ${viewingHistoryItem ? 'fa-book-open text-amber-500' : 'fa-comment-dots text-indigo-500'} mr-2`}></i>
+            {viewingHistoryItem ? 'Conversation Log' : 'Live Transcription'}
           </h3>
           <div className="flex items-center space-x-2">
-            <button 
-              onClick={() => setShowHistory(true)}
-              className="text-xs font-bold text-slate-500 hover:text-indigo-600 transition-colors flex items-center bg-white border border-slate-200 px-3 py-1 rounded-full shadow-sm"
-            >
-              <i className="fa-solid fa-clock-rotate-left mr-2"></i>
-              History
-            </button>
-            <span className="px-2 py-0.5 bg-indigo-100 text-indigo-700 text-[10px] font-bold rounded uppercase">Real-time</span>
+            {!viewingHistoryItem && (
+              <button 
+                onClick={() => setShowHistory(true)}
+                className="text-xs font-bold text-slate-500 hover:text-indigo-600 transition-colors flex items-center bg-white border border-slate-200 px-3 py-1 rounded-full shadow-sm"
+              >
+                <i className="fa-solid fa-clock-rotate-left mr-2"></i>
+                Browse History
+              </button>
+            )}
+            {viewingHistoryItem && (
+              <span className="px-2 py-0.5 bg-amber-100 text-amber-700 text-[10px] font-bold rounded uppercase">Log View</span>
+            )}
           </div>
         </div>
         
         <div className="flex-1 overflow-y-auto p-6 space-y-6 bg-slate-50/30">
           {transcriptions.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-slate-300 space-y-4">
-              <i className="fa-solid fa-microphone-lines text-5xl opacity-20"></i>
-              <p className="text-center max-w-[200px]">Transcriptions will appear here when you start talking</p>
+              <div className="w-20 h-20 bg-slate-100 rounded-full flex items-center justify-center">
+                <i className="fa-solid fa-microphone-lines text-3xl opacity-20"></i>
+              </div>
+              <p className="text-center max-w-[200px] text-xs font-bold uppercase tracking-widest text-slate-400">Transcriptions will appear here</p>
             </div>
           ) : (
             transcriptions.map((t, i) => (
@@ -512,7 +669,7 @@ const LiveVoiceTranslator: React.FC = () => {
           <div className="relative w-full max-w-md bg-white h-full shadow-2xl flex flex-col animate-in slide-in-from-right duration-300">
             <div className="p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50">
               <h3 className="text-xl font-bold text-slate-800 flex items-center">
-                <i className="fa-solid fa-microphone-lines mr-3 text-indigo-600"></i>
+                <i className="fa-solid fa-clock-rotate-left mr-3 text-indigo-600"></i>
                 Voice Logs
               </h3>
               <button 
@@ -528,7 +685,7 @@ const LiveVoiceTranslator: React.FC = () => {
                 <i className="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"></i>
                 <input 
                   type="text"
-                  placeholder="Search in conversations..."
+                  placeholder="Search in logs..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   className="w-full pl-10 pr-4 py-2 bg-slate-100 border-none rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
@@ -540,23 +697,26 @@ const LiveVoiceTranslator: React.FC = () => {
               {history.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-slate-300 space-y-4 py-20">
                   <i className="fa-solid fa-ghost text-5xl opacity-20"></i>
-                  <p className="font-medium">No voice logs saved</p>
+                  <p className="font-medium text-center">Your translated voice conversations will be saved here.</p>
                 </div>
               ) : filteredHistory.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-slate-300 py-20">
                   <i className="fa-solid fa-magnifying-glass text-4xl mb-3 opacity-20"></i>
-                  <p>No matches for "{searchQuery}"</p>
+                  <p>No matches found</p>
                 </div>
               ) : (
                 filteredHistory.map((item) => (
                   <div 
                     key={item.id}
                     onClick={() => selectHistoryItem(item)}
-                    className="group bg-white border border-slate-200 rounded-xl p-4 cursor-pointer hover:border-indigo-400 hover:shadow-md transition-all relative"
+                    className={`group border rounded-xl p-4 cursor-pointer hover:border-indigo-400 hover:shadow-md transition-all relative ${viewingHistoryItem?.id === item.id ? 'bg-indigo-50 border-indigo-300' : 'bg-white border-slate-200'}`}
                   >
                     <div className="flex items-center justify-between mb-2">
-                      <div className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider">
+                      <div className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider flex items-center">
                         {item.messages.length} Turns • {new Date(item.timestamp).toLocaleDateString()}
+                        {item.summary === 'Summarizing conversation...' && (
+                          <i className="fa-solid fa-circle-notch fa-spin ml-2 text-indigo-400"></i>
+                        )}
                       </div>
                       <button 
                         onClick={(e) => deleteHistoryItem(item.id, e)}
@@ -565,12 +725,9 @@ const LiveVoiceTranslator: React.FC = () => {
                         <i className="fa-solid fa-trash-can text-xs"></i>
                       </button>
                     </div>
-                    <p className="text-slate-700 text-sm line-clamp-2 font-medium italic">
-                      "{item.summary}"
+                    <p className={`text-slate-700 text-sm line-clamp-2 font-medium italic ${item.summary === 'Summarizing conversation...' ? 'text-slate-400 animate-pulse' : ''}`}>
+                      {item.summary ? `"${item.summary}"` : 'Log summary unavailable'}
                     </p>
-                    <div className="mt-2 text-[10px] text-slate-400">
-                      {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    </div>
                   </div>
                 ))
               )}
@@ -583,7 +740,7 @@ const LiveVoiceTranslator: React.FC = () => {
                   className="w-full py-3 bg-slate-50 hover:bg-red-50 hover:text-red-600 text-slate-500 rounded-xl text-sm font-bold transition-all border border-slate-100 flex items-center justify-center space-x-2"
                 >
                   <i className="fa-solid fa-broom"></i>
-                  <span>Clear Voice History</span>
+                  <span>Clear All Logs</span>
                 </button>
               </div>
             )}

@@ -1,0 +1,18 @@
+
+{
+  "name": "LinguaLive Translate",
+  "short_name": "LinguaLive",
+  "description": "High-performance real-time translation and voice interpreter.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#6366f1",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3898/3898150.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

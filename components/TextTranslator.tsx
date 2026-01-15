@@ -1,16 +1,10 @@
 
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, Modality, LiveServerMessage } from '@google/genai';
 import { Language, TranslationState, HistoryItem, ALL_LANGUAGES } from '../types';
 import { decode, decodeAudioData, createBlob } from '../utils/audioUtils';
 import { parseApiError } from '../utils/errorUtils';
-
-const SAMPLE_RATES = [
-  { value: 16000, label: '16kHz (Standard)' },
-  { value: 24000, label: '24kHz (High)' },
-  { value: 44100, label: '44.1kHz (CD)' },
-  { value: 48000, label: '48kHz (Pro)' },
-];
+import { offlineTranslate, getOfflineSuggestions } from '../utils/offlineEngine';
 
 const AVAILABLE_VOICES = [
   { id: 'Zephyr', label: 'Zephyr', desc: 'Balanced & Natural' },
@@ -19,6 +13,15 @@ const AVAILABLE_VOICES = [
   { id: 'Kore', label: 'Kore', desc: 'Clear & Soft' },
   { id: 'Fenrir', label: 'Fenrir', desc: 'Warm & Solid' },
 ];
+
+const VOICE_INPUT_LIMIT_SEC = 60;
+const CONCURRENCY_LIMIT = 3; // Number of sentences to translate simultaneously
+
+interface SentenceJob {
+  source: string;
+  translated: string;
+  status: 'pending' | 'translating' | 'done' | 'error';
+}
 
 const TextTranslator: React.FC = () => {
   const [state, setState] = useState<TranslationState>({
@@ -31,15 +34,28 @@ const TextTranslator: React.FC = () => {
     pronunciationGuide: '',
   });
 
-  const [isListening, setIsListening] = useState(false);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [isOfflineResult, setIsOfflineResult] = useState(false);
+  const [showOfflineSuggestions, setShowOfflineSuggestions] = useState(false);
+
+  useEffect(() => {
+    const handleStatusChange = () => setIsOnline(navigator.onLine);
+    window.addEventListener('online', handleStatusChange);
+    window.addEventListener('offline', handleStatusChange);
+    return () => {
+      window.removeEventListener('online', handleStatusChange);
+      window.removeEventListener('offline', handleStatusChange);
+    };
+  }, []);
+
+  // Voice & Live States
+  const [isLiveMode, setIsLiveMode] = useState(false);
+  const [listeningTimeLeft, setListeningTimeLeft] = useState(VOICE_INPUT_LIMIT_SEC);
+  const [micLevel, setMicLevel] = useState(0);
+  const listeningIntervalRef = useRef<number | null>(null);
+
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [showHistory, setShowHistory] = useState(false);
-  const [historySearchQuery, setHistorySearchQuery] = useState('');
-  
-  const [voiceSampleRate, setVoiceSampleRate] = useState<number>(() => {
-    const saved = localStorage.getItem('lingua_voice_sample_rate');
-    return saved ? parseInt(saved, 10) : 16000;
-  });
   
   const [speechRate, setSpeechRate] = useState<number>(() => {
     const saved = localStorage.getItem('lingua_speech_rate');
@@ -56,25 +72,27 @@ const TextTranslator: React.FC = () => {
   });
 
   const [isVoicePanelOpen, setIsVoicePanelOpen] = useState(false);
-  const [isAutoDetect, setIsAutoDetect] = useState(false);
+  const [isAutoDetect, setIsAutoDetect] = useState(true);
   const [isDetecting, setIsDetecting] = useState(false);
+  const [lastDetectedLanguage, setLastDetectedLanguage] = useState<Language | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isGeneratingGuide, setIsGeneratingGuide] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
 
-  const [isBatchMode, setIsBatchMode] = useState(false);
-  const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 });
-  const [isBatchActive, setIsBatchActive] = useState(false);
-  const [isBatchPaused, setIsBatchPaused] = useState(false);
-  
+  const [sentenceJobs, setSentenceJobs] = useState<SentenceJob[]>([]);
+  const [isSequentialMode, setIsSequentialMode] = useState(false);
+
+  // Refs for audio and live sessions
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const outputAudioCtxRef = useRef<AudioContext | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
   const ttsAudioCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const detectionTimerRef = useRef<number | null>(null);
-  const isBatchCancelledRef = useRef(false);
-  const isBatchPausedRef = useRef(false);
   const ttsSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const languageSelectRef = useRef<HTMLSelectElement>(null);
+  const lastProcessedTextRef = useRef<string>('');
 
   useEffect(() => {
     const savedHistory = localStorage.getItem('lingua_history');
@@ -92,10 +110,6 @@ const TextTranslator: React.FC = () => {
   }, [history]);
 
   useEffect(() => {
-    localStorage.setItem('lingua_voice_sample_rate', voiceSampleRate.toString());
-  }, [voiceSampleRate]);
-
-  useEffect(() => {
     localStorage.setItem('lingua_speech_rate', speechRate.toString());
   }, [speechRate]);
 
@@ -107,44 +121,36 @@ const TextTranslator: React.FC = () => {
     localStorage.setItem('lingua_auto_play', isAutoPlayEnabled.toString());
   }, [isAutoPlayEnabled]);
 
-  const filteredHistory = useMemo(() => {
-    if (!historySearchQuery.trim()) return history;
-    const query = historySearchQuery.toLowerCase();
-    return history.filter(item => 
-      item.sourceText.toLowerCase().includes(query) || 
-      item.translatedText.toLowerCase().includes(query)
-    );
-  }, [history, historySearchQuery]);
-
+  // Real-Time Detection
   useEffect(() => {
-    if (!isAutoDetect || !state.sourceText.trim() || state.sourceText.length < 5) {
+    const text = state.sourceText.trim();
+    if (!isOnline || !isAutoDetect || text.length < 3 || text === lastProcessedTextRef.current || isLiveMode) {
+      if (!text) setLastDetectedLanguage(null);
       setIsDetecting(false);
       return;
     }
 
-    if (detectionTimerRef.current) {
-      window.clearTimeout(detectionTimerRef.current);
-    }
+    if (detectionTimerRef.current) window.clearTimeout(detectionTimerRef.current);
 
     detectionTimerRef.current = window.setTimeout(async () => {
       setIsDetecting(true);
+      lastProcessedTextRef.current = text;
       try {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
         const response = await ai.models.generateContent({
           model: 'gemini-3-flash-preview',
-          contents: `Identify the language of the following text. Respond ONLY with exactly one word from this list: ${ALL_LANGUAGES.join(', ')}. If you are uncertain, respond with the most likely one. \n\nText: ${state.sourceText.substring(0, 200)}`,
-          config: {
-            temperature: 0,
-            topP: 1,
-          }
+          contents: `Detect language: ${text.substring(0, 350)}. List: ${ALL_LANGUAGES.join(', ')}. Return ONLY the name.`,
+          config: { temperature: 0 },
         });
-
         const detected = response.text?.trim() as Language;
-        if (detected && ALL_LANGUAGES.includes(detected) && detected !== state.sourceLanguage) {
-          setState(prev => ({ ...prev, sourceLanguage: detected }));
+        if (detected && ALL_LANGUAGES.includes(detected)) {
+          setLastDetectedLanguage(detected);
+          if (isAutoDetect && detected !== state.sourceLanguage) {
+            setState(prev => ({ ...prev, sourceLanguage: detected }));
+          }
         }
       } catch (err) {
-        console.error('Language detection failed:', err);
+        console.error('Detection error:', err);
       } finally {
         setIsDetecting(false);
       }
@@ -153,221 +159,12 @@ const TextTranslator: React.FC = () => {
     return () => {
       if (detectionTimerRef.current) window.clearTimeout(detectionTimerRef.current);
     };
-  }, [state.sourceText, isAutoDetect, state.sourceLanguage]);
+  }, [state.sourceText, isAutoDetect, isOnline, isLiveMode]);
 
-  const handleTranslate = async () => {
-    if (!state.sourceText.trim()) return;
-
-    if (isBatchMode) {
-      startBatchTranslation();
-      return;
-    }
-
-    setState(prev => ({ ...prev, isLoading: true, error: null, translatedText: '', pronunciationGuide: '' }));
-    setShowGuide(false);
-
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: `Translate the following ${state.sourceLanguage} text into ${state.targetLanguage}. Output ONLY the translated text.\n\nText: ${state.sourceText}`,
-        config: {
-          temperature: 0.3,
-          topP: 1,
-        }
-      });
-
-      const translated = response.text || '';
-      setState(prev => ({
-        ...prev,
-        translatedText: translated,
-        isLoading: false
-      }));
-
-      saveToHistory(state.sourceText, translated);
-
-      if (isAutoPlayEnabled && translated) {
-        handleSpeak(translated);
-      }
-    } catch (err: any) {
-      console.error(err);
-      setState(prev => ({
-        ...prev,
-        isLoading: false,
-        error: parseApiError(err)
-      }));
-    }
-  };
-
-  const handleGenerateGuide = async () => {
-    if (!state.translatedText || isGeneratingGuide) return;
-    
-    setIsGeneratingGuide(true);
-    setShowGuide(true);
-    setState(prev => ({ ...prev, error: null }));
-    
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-      
-      let formatInstructions = 'IPA (International Phonetic Alphabet)';
-      if (state.targetLanguage === 'Chinese') formatInstructions = 'Pinyin with tone marks';
-      else if (state.targetLanguage === 'Japanese') formatInstructions = 'Romaji';
-      else if (state.targetLanguage === 'Korean') formatInstructions = 'Revised Romanization';
-      else if (state.targetLanguage === 'Urdu') formatInstructions = 'Romanized Urdu (Transliteration)';
-      else formatInstructions = 'IPA (International Phonetic Alphabet)';
-      
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: `Generate a clear pronunciation guide for this ${state.targetLanguage} text: "${state.translatedText}". 
-          Use ${formatInstructions}. 
-          Output ONLY the guide text, no headers or extra explanation. If it's a long text, maintain the structure.`,
-        config: { temperature: 0.1 }
-      });
-
-      setState(prev => ({ ...prev, pronunciationGuide: response.text || '' }));
-    } catch (err) {
-      console.error('Failed to generate pronunciation guide:', err);
-      setState(prev => ({ ...prev, error: parseApiError(err) }));
-    } finally {
-      setIsGeneratingGuide(false);
-    }
-  };
-
-  const handleSpeak = async (textToSpeak?: string) => {
-    const text = textToSpeak || state.translatedText;
-    
-    if (isSpeaking) {
-      stopSpeaking();
-      if (!textToSpeak) return; 
-    }
-
-    if (!text) return;
-
-    setIsSpeaking(true);
-    setState(prev => ({ ...prev, error: null }));
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-preview-tts',
-        contents: [{ parts: [{ text: `Please read this ${state.targetLanguage} text naturally: ${text}` }] }],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: selectedVoice },
-            },
-          },
-        },
-      });
-
-      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (base64Audio) {
-        if (!ttsAudioCtxRef.current) {
-          ttsAudioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-        }
-        const ctx = ttsAudioCtxRef.current;
-        if (ctx.state === 'suspended') await ctx.resume();
-
-        const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuffer;
-        
-        source.playbackRate.value = speechRate;
-        
-        source.connect(ctx.destination);
-        source.onended = () => {
-          setIsSpeaking(false);
-          ttsSourceRef.current = null;
-        };
-
-        ttsSourceRef.current = source;
-        source.start();
-      } else {
-        setIsSpeaking(false);
-        throw new Error("No audio data returned from the service.");
-      }
-    } catch (err) {
-      console.error('TTS failed:', err);
-      setIsSpeaking(false);
-      setState(prev => ({ ...prev, error: parseApiError(err) }));
-    }
-  };
-
-  const stopSpeaking = () => {
-    if (ttsSourceRef.current) {
-      try {
-        ttsSourceRef.current.stop();
-      } catch (e) {}
-      ttsSourceRef.current = null;
-    }
-    setIsSpeaking(false);
-  };
-
-  const startBatchTranslation = async () => {
-    const sentences = state.sourceText.match(/[^.!?。！？\n]+[.!?。！？\n]*/g) || [state.sourceText];
-    if (sentences.length === 0) return;
-
-    setIsBatchActive(true);
-    setIsBatchPaused(false);
-    isBatchPausedRef.current = false;
-    isBatchCancelledRef.current = false;
-    setBatchProgress({ current: 0, total: sentences.length });
-    setState(prev => ({ ...prev, translatedText: '', isLoading: true, error: null, pronunciationGuide: '' }));
-    setShowGuide(false);
-
-    let currentResult = '';
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-
-    for (let i = 0; i < sentences.length; i++) {
-      if (isBatchCancelledRef.current) break;
-
-      while (isBatchPausedRef.current && !isBatchCancelledRef.current) {
-        await new Promise(r => setTimeout(r, 500));
-      }
-      if (isBatchCancelledRef.current) break;
-
-      try {
-        const response = await ai.models.generateContent({
-          model: 'gemini-3-flash-preview',
-          contents: `Translate this single sentence from ${state.sourceLanguage} to ${state.targetLanguage}: "${sentences[i].trim()}"`,
-          config: { temperature: 0.1 }
-        });
-
-        const translatedSentence = response.text || '';
-        currentResult += translatedSentence + ' ';
-        
-        setBatchProgress({ current: i + 1, total: sentences.length });
-        setState(prev => ({ ...prev, translatedText: currentResult.trim() }));
-      } catch (err) {
-        console.error('Batch error at sentence', i, err);
-        setState(prev => ({ ...prev, error: `Batch processing failed at sentence ${i+1}: ${parseApiError(err)}` }));
-        break;
-      }
-    }
-
-    if (!isBatchCancelledRef.current && !state.error) {
-      saveToHistory(state.sourceText, currentResult.trim());
-      if (isAutoPlayEnabled && currentResult.trim()) {
-        handleSpeak(currentResult.trim());
-      }
-    }
-
-    setIsBatchActive(false);
-    setState(prev => ({ ...prev, isLoading: false }));
-  };
-
-  const togglePauseBatch = () => {
-    const newVal = !isBatchPaused;
-    setIsBatchPaused(newVal);
-    isBatchPausedRef.current = newVal;
-  };
-
-  const cancelBatch = () => {
-    isBatchCancelledRef.current = true;
-    setIsBatchActive(false);
-    setIsBatchPaused(false);
-    isBatchPausedRef.current = false;
-    setState(prev => ({ ...prev, isLoading: false }));
+  const handleCorrectDetection = () => {
+    setIsAutoDetect(false);
+    setLastDetectedLanguage(null);
+    languageSelectRef.current?.focus();
   };
 
   const saveToHistory = (source: string, translated: string) => {
@@ -378,642 +175,589 @@ const TextTranslator: React.FC = () => {
       sourceLanguage: state.sourceLanguage,
       targetLanguage: state.targetLanguage,
       timestamp: Date.now(),
-      voice: selectedVoice,
-      speechRate: speechRate,
     };
     setHistory(prev => [newItem, ...prev].slice(0, 50));
   };
 
-  const swapLanguages = () => {
-    setIsAutoDetect(false);
-    setState(prev => ({
-      ...prev,
-      sourceLanguage: prev.targetLanguage,
-      targetLanguage: prev.sourceLanguage,
-      sourceText: prev.translatedText,
-      translatedText: prev.sourceText,
-      pronunciationGuide: '',
-      error: null
-    }));
-    setShowGuide(false);
+  const handleSpeak = async (textToSpeak: string) => {
+    if (isSpeaking) {
+      ttsSourceRef.current?.stop();
+      setIsSpeaking(false);
+      return;
+    }
+    setIsSpeaking(true);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash-preview-tts',
+        contents: [{ parts: [{ text: textToSpeak }] }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: selectedVoice } },
+          },
+        },
+      });
+      if (!ttsAudioCtxRef.current) ttsAudioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      const ctx = ttsAudioCtxRef.current;
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (base64Audio) {
+        const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.playbackRate.value = speechRate;
+        source.connect(ctx.destination);
+        ttsSourceRef.current = source;
+        source.onended = () => { setIsSpeaking(false); ttsSourceRef.current = null; };
+        source.start();
+      } else {
+        setIsSpeaking(false);
+      }
+    } catch (err) {
+      console.error('TTS Error:', err);
+      setIsSpeaking(false);
+    }
   };
 
-  const startListening = async () => {
-    if (isListening) {
-      stopListening();
+  const splitIntoSentences = (text: string): string[] => {
+    // Advanced split that captures CJK and Western sentence delimiters
+    const parts = text.split(/([.!?。！？]\s*|\n+)/).filter(Boolean);
+    const result: string[] = [];
+    
+    let currentSentence = "";
+    for (const part of parts) {
+      if (/^[.!?。！？\s\n]+$/.test(part)) {
+        currentSentence += part;
+        result.push(currentSentence.trim());
+        currentSentence = "";
+      } else {
+        if (currentSentence) result.push(currentSentence.trim());
+        currentSentence = part;
+      }
+    }
+    if (currentSentence.trim()) result.push(currentSentence.trim());
+    
+    return result.filter(s => s.length > 0);
+  };
+
+  const handleGenerateGuide = async () => {
+    if (!state.translatedText || isGeneratingGuide) return;
+    
+    setShowGuide(true);
+    setIsGeneratingGuide(true);
+    
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: `Provide a phonetic pronunciation guide (IPA or simple phonetic notation) for the following ${state.targetLanguage} text: "${state.translatedText}". Return ONLY the guide text without any preamble.`,
+        config: { temperature: 0.1 }
+      });
+      
+      const guide = response.text?.trim() || 'Guide unavailable';
+      setState(prev => ({ ...prev, pronunciationGuide: guide }));
+    } catch (err) {
+      console.error('Failed to generate pronunciation guide:', err);
+      setState(prev => ({ ...prev, pronunciationGuide: 'Phonetic guide generation failed.' }));
+    } finally {
+      setIsGeneratingGuide(false);
+    }
+  };
+
+  const handleTranslate = async () => {
+    const text = state.sourceText.trim();
+    if (!text) return;
+    
+    setState(prev => ({ ...prev, isLoading: true, error: null, translatedText: '', pronunciationGuide: '' }));
+    setIsOfflineResult(false);
+    setShowOfflineSuggestions(false);
+    setShowGuide(false);
+
+    if (!isOnline) {
+      setTimeout(() => {
+        const offlineResult = offlineTranslate(text, state.sourceLanguage, state.targetLanguage);
+        if (offlineResult) {
+          setState(prev => ({ ...prev, translatedText: offlineResult, isLoading: false }));
+          setIsOfflineResult(true);
+        } else {
+          setShowOfflineSuggestions(true);
+          setState(prev => ({ 
+            ...prev, 
+            isLoading: false, 
+            error: "Basic offline translation is limited. Try reconnecting for advanced AI translation or explore common phrases below." 
+          }));
+        }
+      }, 500);
       return;
     }
 
-    setState(prev => ({ ...prev, error: null }));
+    const sentences = splitIntoSentences(text);
+    
+    // Single sentence translation
+    if (sentences.length <= 1) {
+      setIsSequentialMode(false);
+      try {
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        const response = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: `Translate from ${state.sourceLanguage} to ${state.targetLanguage}: "${text}"`,
+          config: { temperature: 0.2 }
+        });
+        const translated = response.text || '';
+        setState(prev => ({ ...prev, translatedText: translated, isLoading: false }));
+        saveToHistory(text, translated);
+        if (isAutoPlayEnabled && translated) handleSpeak(translated);
+      } catch (err: any) {
+        setState(prev => ({ ...prev, isLoading: false, error: parseApiError(err) }));
+      }
+      return;
+    }
+
+    // Chunked concurrent translation
+    setIsSequentialMode(true);
+    const initialJobs: SentenceJob[] = sentences.map(s => ({ source: s, translated: '', status: 'pending' }));
+    setSentenceJobs(initialJobs);
+
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const pool = [...sentences.entries()];
+    
+    const translateSentence = async (index: number, content: string) => {
+      setSentenceJobs(prev => {
+        const next = [...prev];
+        next[index] = { ...next[index], status: 'translating' };
+        return next;
+      });
+
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: `Translate this ${state.sourceLanguage} sentence into ${state.targetLanguage}: "${content}"`,
+          config: { temperature: 0.1 }
+        });
+        const result = response.text?.trim() || '';
+        setSentenceJobs(prev => {
+          const next = [...prev];
+          next[index] = { ...next[index], status: 'done', translated: result };
+          return next;
+        });
+        return result;
+      } catch (err) {
+        setSentenceJobs(prev => {
+          const next = [...prev];
+          next[index] = { ...next[index], status: 'error' };
+          return next;
+        });
+        return `[Translation Error]`;
+      }
+    };
+
+    // Process pool with concurrency limit
+    const workers = Array(Math.min(CONCURRENCY_LIMIT, sentences.length)).fill(null).map(async () => {
+      while (pool.length > 0) {
+        const item = pool.shift();
+        if (item) {
+          await translateSentence(item[0], item[1]);
+        }
+      }
+    });
+
+    await Promise.all(workers);
+
+    // Assembly
+    setSentenceJobs(prev => {
+      const fullText = prev.map(j => j.translated || '').join(' ').trim();
+      setState(s => ({ ...s, translatedText: fullText, isLoading: false }));
+      saveToHistory(text, fullText);
+      if (isAutoPlayEnabled && fullText) handleSpeak(fullText);
+      return prev;
+    });
+  };
+
+  const toggleLiveInterpreter = async () => {
+    if (isLiveMode) {
+      stopLiveSession();
+      return;
+    }
+
+    if (!isOnline) {
+      setState(prev => ({ ...prev, error: 'Live Interpretation requires an active connection.' }));
+      return;
+    }
+
+    setIsLiveMode(true);
+    setState(prev => ({ ...prev, sourceText: '', translatedText: '', error: null }));
+    setListeningTimeLeft(VOICE_INPUT_LIMIT_SEC);
+
+    listeningIntervalRef.current = window.setInterval(() => {
+      setListeningTimeLeft(prev => {
+        if (prev <= 1) { stopLiveSession(); return 0; }
+        return prev - 1;
+      });
+    }, 1000);
+
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      const rate = voiceSampleRate;
-      audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: rate });
+      audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      outputAudioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       
+      const systemInstruction = `You are a real-time translator. Translate everything the user says from ${state.sourceLanguage} to ${state.targetLanguage}.
+      - Speak the translation immediately in ${state.targetLanguage}.
+      - Do not add conversational filler.
+      - Provide text transcriptions for both input and output.`;
+
       const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           inputAudioTranscription: {},
-          systemInstruction: `You are a transcription assistant. The user is speaking ${state.sourceLanguage}. Transcribe their speech accurately. Do not respond with audio.`,
+          outputAudioTranscription: {},
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: selectedVoice } } },
+          systemInstruction,
         },
         callbacks: {
           onopen: () => {
-            setIsListening(true);
             const source = audioCtxRef.current!.createMediaStreamSource(stream);
             const scriptProcessor = audioCtxRef.current!.createScriptProcessor(4096, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
-              const pcmBlob = createBlob(inputData, rate);
-              sessionPromise.then((session) => {
-                session.sendRealtimeInput({ media: pcmBlob });
-              });
-            };
+              const pcmBlob = createBlob(inputData, 16000);
+              
+              // Volume analysis
+              let sum = 0;
+              for(let i=0; i<inputData.length; i++) sum += Math.abs(inputData[i]);
+              setMicLevel(Math.min(100, (sum / inputData.length) * 1000));
 
+              sessionPromise.then(s => s.sendRealtimeInput({ media: pcmBlob }));
+            };
             source.connect(scriptProcessor);
             scriptProcessor.connect(audioCtxRef.current!.destination);
           },
-          onmessage: async (message: LiveServerMessage) => {
-            if (message.serverContent?.inputTranscription) {
-              const text = message.serverContent.inputTranscription.text;
-              setState(prev => ({
-                ...prev,
-                sourceText: prev.sourceText + text
-              }));
+          onmessage: async (m: LiveServerMessage) => {
+            const audioData = m.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+            if (audioData) {
+              const outCtx = outputAudioCtxRef.current!;
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outCtx.currentTime);
+              const audioBuffer = await decodeAudioData(decode(audioData), outCtx, 24000, 1);
+              const source = outCtx.createBufferSource();
+              source.buffer = audioBuffer;
+              source.connect(outCtx.destination);
+              source.start(nextStartTimeRef.current);
+              nextStartTimeRef.current += audioBuffer.duration;
+            }
+
+            if (m.serverContent?.inputTranscription) {
+              setState(prev => ({ ...prev, sourceText: prev.sourceText + ' ' + m.serverContent!.inputTranscription!.text }));
+            }
+            if (m.serverContent?.outputTranscription) {
+              setState(prev => ({ ...prev, translatedText: prev.translatedText + ' ' + m.serverContent!.outputTranscription!.text }));
             }
           },
-          onerror: (e) => {
-            console.error('Transcription error:', e);
-            setState(prev => ({ ...prev, error: `Transcription failed: ${parseApiError(e)}` }));
-            stopListening();
-          },
-          onclose: () => {
-            stopListening();
-          }
+          onerror: (e) => { console.error('Live Error:', e); stopLiveSession(); },
+          onclose: () => stopLiveSession(),
         }
       });
-
       sessionPromiseRef.current = sessionPromise;
     } catch (err) {
-      console.error('Failed to start transcription:', err);
-      setState(prev => ({ ...prev, error: parseApiError(err) }));
-      stopListening();
+      console.error('Mic Access Error:', err);
+      stopLiveSession();
+      setState(prev => ({ ...prev, error: 'Microphone access denied or service unavailable.' }));
     }
   };
 
-  const stopListening = () => {
-    setIsListening(false);
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close();
-      audioCtxRef.current = null;
-    }
-    if (sessionPromiseRef.current) {
-      sessionPromiseRef.current.then(session => session.close());
-      sessionPromiseRef.current = null;
+  const stopLiveSession = () => {
+    setIsLiveMode(false);
+    setMicLevel(0);
+    if (listeningIntervalRef.current) clearInterval(listeningIntervalRef.current);
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    audioCtxRef.current?.close().catch(() => {});
+    outputAudioCtxRef.current?.close().catch(() => {});
+    sessionPromiseRef.current?.then(s => s.close()).catch(() => {});
+    
+    if (state.sourceText && state.translatedText) {
+      saveToHistory(state.sourceText, state.translatedText);
     }
   };
 
-  const selectHistoryItem = (item: HistoryItem) => {
-    setIsAutoDetect(false);
-    setState({
-      sourceText: item.sourceText,
-      translatedText: item.translatedText,
-      sourceLanguage: item.sourceLanguage,
-      targetLanguage: item.targetLanguage,
-      isLoading: false,
-      error: null,
-      pronunciationGuide: '',
-    });
-
-    if (item.voice) {
-      setSelectedVoice(item.voice);
-    }
-    if (item.speechRate !== undefined) {
-      setSpeechRate(item.speechRate);
-    }
-
-    setShowGuide(false);
-    setShowHistory(false);
-    setHistorySearchQuery('');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-
-  const deleteHistoryItem = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setHistory(prev => prev.filter(item => item.id !== id));
-  };
-
-  const clearHistory = () => {
-    if (window.confirm('Are you sure you want to clear your translation history?')) {
-      setHistory([]);
-    }
-  };
-
-  useEffect(() => {
-    return () => {
-      stopListening();
-      stopSpeaking();
-      if (detectionTimerRef.current) window.clearTimeout(detectionTimerRef.current);
-      if (ttsAudioCtxRef.current) ttsAudioCtxRef.current.close();
-    };
-  }, []);
-
-  const progressPercent = batchProgress.total > 0 
-    ? Math.round((batchProgress.current / batchProgress.total) * 100) 
-    : 0;
+  const completedJobsCount = sentenceJobs.filter(j => j.status === 'done' || j.status === 'error').length;
+  const progressPercent = sentenceJobs.length > 0 ? (completedJobsCount / sentenceJobs.length) * 100 : 0;
 
   return (
-    <div className="space-y-6 relative">
-      <div className="bg-white rounded-2xl shadow-xl overflow-hidden border border-slate-200">
-        <div className="p-4 bg-slate-50 border-b flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="flex items-center space-x-2">
-            <div className="flex items-center">
-              <select 
-                value={state.sourceLanguage}
-                onChange={(e) => {
-                  setIsAutoDetect(false);
-                  setState(prev => ({ ...prev, sourceLanguage: e.target.value as Language }));
-                }}
-                className={`bg-white border border-slate-300 rounded-l-lg px-3 py-2 text-sm font-medium focus:ring-2 focus:ring-indigo-500 outline-none cursor-pointer hover:border-indigo-300 transition-colors ${isAutoDetect ? 'border-indigo-500 bg-indigo-50/30' : ''}`}
-              >
-                {ALL_LANGUAGES.map(lang => (
-                  <option key={`source-${lang}`} value={lang}>{lang}</option>
-                ))}
-              </select>
-              <button
-                onClick={() => setIsAutoDetect(!isAutoDetect)}
-                className={`px-3 py-2 border-y border-r border-slate-300 rounded-r-lg text-[10px] font-bold uppercase transition-all flex items-center space-x-1.5 ${
-                  isAutoDetect 
-                  ? 'bg-indigo-600 text-white border-indigo-600' 
-                  : 'bg-white text-slate-400 hover:bg-slate-50'
-                }`}
-                title="Toggle Auto-detect Language"
-              >
-                {isDetecting ? (
-                  <i className="fa-solid fa-wand-sparkles animate-pulse"></i>
-                ) : (
-                  <i className="fa-solid fa-magnifying-glass"></i>
-                )}
-                <span>Auto</span>
-              </button>
-            </div>
-            
-            <button 
-              onClick={swapLanguages}
-              className="w-10 h-10 rounded-full hover:bg-indigo-50 text-slate-400 hover:text-indigo-600 transition-all flex items-center justify-center border border-slate-200 bg-white shadow-sm active:scale-95"
-              title="Swap Languages"
+    <div className="space-y-6">
+      <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-center space-x-2 flex-1 min-w-[320px]">
+          <div className="relative flex-1">
+            <select
+              ref={languageSelectRef}
+              value={state.sourceLanguage}
+              onChange={(e) => { setIsAutoDetect(false); setState(prev => ({ ...prev, sourceLanguage: e.target.value as Language })); }}
+              className={`w-full bg-slate-50 border rounded-lg px-3 py-2 text-sm font-semibold focus:ring-2 focus:ring-indigo-500 outline-none cursor-pointer transition-all ${isAutoDetect ? 'border-indigo-400' : 'border-slate-300'}`}
             >
-              <i className="fa-solid fa-right-left text-sm"></i>
-            </button>
-
-            <select 
-              value={state.targetLanguage}
-              onChange={(e) => setState(prev => ({ ...prev, targetLanguage: e.target.value as Language }))}
-              className="bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm font-medium focus:ring-2 focus:ring-indigo-500 outline-none cursor-pointer hover:border-indigo-300 transition-colors"
-            >
-              {ALL_LANGUAGES.map(lang => (
-                <option key={`target-${lang}`} value={lang}>{lang}</option>
-              ))}
+              {ALL_LANGUAGES.map(lang => <option key={`src-${lang}`} value={lang}>{lang}</option>)}
             </select>
-          </div>
-
-          <div className="flex items-center space-x-2">
-            <button
-              onClick={() => setIsBatchMode(!isBatchMode)}
-              className={`px-3 py-2 rounded-lg text-xs font-bold transition-all border ${
-                isBatchMode ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-slate-100 text-slate-500 border-transparent hover:bg-slate-200'
-              }`}
-              title="Sentence-by-Sentence Mode"
-            >
-              <i className="fa-solid fa-list-ol mr-2"></i>
-              Step-by-Step
-            </button>
-            
-            <button
-              onClick={() => setIsVoicePanelOpen(!isVoicePanelOpen)}
-              className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all ${
-                isVoicePanelOpen ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
-              }`}
-              title="Voice & Audio Settings"
-            >
-              <i className="fa-solid fa-gear"></i>
-            </button>
-
-            <button
-              onClick={() => setShowHistory(!showHistory)}
-              className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all ${
-                showHistory ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
-              }`}
-              title="View History"
-            >
-              <i className="fa-solid fa-clock-rotate-left"></i>
-            </button>
-            
-            <button 
-              onClick={handleTranslate}
-              disabled={state.isLoading || !state.sourceText.trim() || isBatchActive}
-              className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white px-6 py-2 rounded-lg font-bold shadow-md transition-all flex items-center justify-center min-w-[140px]"
-            >
-              {state.isLoading && !isBatchActive ? (
-                <i className="fa-solid fa-circle-notch fa-spin mr-2"></i>
-              ) : (
-                <i className="fa-solid fa-wand-magic-sparkle mr-2"></i>
-              )}
-              Translate
-            </button>
-          </div>
-        </div>
-
-        {isVoicePanelOpen && (
-          <div className="bg-white border-b border-slate-200 p-6 animate-in slide-in-from-top-2 duration-300">
-            <div className="max-w-4xl mx-auto">
-              <div className="flex items-center justify-between mb-6">
-                <h4 className="text-sm font-bold text-slate-800 flex items-center">
-                  <i className="fa-solid fa-sliders mr-2 text-indigo-500"></i>
-                  Voice & Audio Preferences
-                </h4>
-                <button 
-                  onClick={() => setIsVoicePanelOpen(false)}
-                  className="text-slate-400 hover:text-slate-600 transition-colors"
-                >
-                  <i className="fa-solid fa-times"></i>
-                </button>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-                <div className="space-y-3">
-                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Voice Character</p>
-                  <div className="flex flex-col space-y-1">
-                    {AVAILABLE_VOICES.map((voice) => (
-                      <button
-                        key={voice.id}
-                        onClick={() => setSelectedVoice(voice.id)}
-                        className={`w-full text-left px-4 py-2 rounded-xl text-xs transition-all flex items-center justify-between ${
-                          selectedVoice === voice.id 
-                          ? 'bg-indigo-600 text-white shadow-md font-bold' 
-                          : 'bg-slate-50 text-slate-600 hover:bg-slate-100 border border-transparent'
-                        }`}
-                      >
-                        <div className="flex flex-col">
-                          <span>{voice.label}</span>
-                          <span className={`text-[9px] opacity-70 ${selectedVoice === voice.id ? 'text-indigo-100' : 'text-slate-400'}`}>
-                            {voice.desc}
-                          </span>
-                        </div>
-                        {selectedVoice === voice.id && <i className="fa-solid fa-check text-[10px]"></i>}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="space-y-6">
-                  <div>
-                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-3">Speech Rate</p>
-                    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100">
-                      <div className="flex items-center justify-between mb-2">
-                        <i className="fa-solid fa-gauge-high text-xs text-slate-400"></i>
-                        <span className="text-xs font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded">{speechRate.toFixed(1)}x</span>
-                      </div>
-                      <input 
-                        type="range" 
-                        min="0.5" 
-                        max="2.0" 
-                        step="0.1" 
-                        value={speechRate}
-                        onChange={(e) => setSpeechRate(parseFloat(e.target.value))}
-                        className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
-                      />
-                    </div>
-                  </div>
-
-                  <div>
-                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-3">Behavior</p>
-                    <label className="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-slate-100 cursor-pointer hover:bg-slate-100 transition-colors">
-                      <div className="flex items-center space-x-3">
-                        <i className="fa-solid fa-play-circle text-indigo-500"></i>
-                        <span className="text-xs font-semibold text-slate-700">Auto-play Translation</span>
-                      </div>
-                      <div className="relative">
-                        <input 
-                          type="checkbox" 
-                          className="sr-only" 
-                          checked={isAutoPlayEnabled} 
-                          onChange={() => setIsAutoPlayEnabled(!isAutoPlayEnabled)}
-                        />
-                        <div className={`block w-8 h-5 rounded-full transition-colors ${isAutoPlayEnabled ? 'bg-indigo-600' : 'bg-slate-300'}`}></div>
-                        <div className={`dot absolute left-1 top-1 bg-white w-3 h-3 rounded-full transition-transform ${isAutoPlayEnabled ? 'translate-x-3' : ''}`}></div>
-                      </div>
-                    </label>
-                  </div>
-                </div>
-
-                <div className="space-y-3">
-                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Audio Quality (Sample Rate)</p>
-                  <div className="grid grid-cols-1 gap-1.5">
-                    {SAMPLE_RATES.map((rate) => (
-                      <button
-                        key={rate.value}
-                        onClick={() => setVoiceSampleRate(rate.value)}
-                        className={`text-left px-4 py-2.5 rounded-xl text-xs font-medium transition-all flex items-center justify-between ${
-                          voiceSampleRate === rate.value 
-                          ? 'bg-indigo-50 text-indigo-700 border-indigo-200 border shadow-sm' 
-                          : 'bg-white text-slate-500 border-slate-200 border hover:bg-slate-50'
-                        }`}
-                      >
-                        <span>{rate.label}</span>
-                        {voiceSampleRate === rate.value && <i className="fa-solid fa-circle-check text-[10px]"></i>}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {isBatchActive && (
-          <div className="bg-indigo-50 px-6 py-4 border-b border-indigo-100 animate-in fade-in slide-in-from-top-2">
-            <div className="flex items-center justify-between mb-3">
-              <div className="flex items-center space-x-4">
-                <div className="text-indigo-700 font-bold text-sm">
-                  {isBatchPaused ? 'Paused' : 'Translating'}: Sentence {batchProgress.current} of {batchProgress.total}
-                </div>
-                <div className="flex bg-indigo-100 rounded-full h-2 w-48 overflow-hidden">
-                  <div 
-                    className="bg-indigo-600 h-full transition-all duration-500 ease-out"
-                    style={{ width: `${progressPercent}%` }}
-                  ></div>
-                </div>
-                <div className="text-indigo-600 font-bold text-xs">{progressPercent}%</div>
-              </div>
-              <div className="flex items-center space-x-2">
-                <button 
-                  onClick={togglePauseBatch}
-                  className="px-4 py-1.5 bg-white border border-indigo-200 text-indigo-600 rounded-lg text-xs font-bold hover:bg-indigo-100 transition-colors flex items-center"
-                >
-                  <i className={`fa-solid ${isBatchPaused ? 'fa-play' : 'fa-pause'} mr-2`}></i>
-                  {isBatchPaused ? 'Resume' : 'Pause'}
-                </button>
-                <button 
-                  onClick={cancelBatch}
-                  className="px-4 py-1.5 bg-red-50 text-red-600 border border-red-100 rounded-lg text-xs font-bold hover:bg-red-100 transition-colors flex items-center"
-                >
-                  <i className="fa-solid fa-xmark mr-2"></i>
-                  Cancel
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        <div className="grid md:grid-cols-2 divide-y md:divide-y-0 md:divide-x border-slate-200">
-          <div className="p-6 relative">
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center space-x-2">
-                <label className="block text-xs font-bold text-slate-400 uppercase tracking-wider">Source Text ({state.sourceLanguage})</label>
-                {isDetecting && (
-                  <span className="flex items-center text-[10px] text-indigo-500 animate-pulse font-bold">
-                    <i className="fa-solid fa-ellipsis fa-fade mr-1"></i>
-                    Detecting...
-                  </span>
-                )}
-              </div>
-              
-              <div className="flex items-center space-x-2">
-                <button
-                  onClick={startListening}
-                  className={`flex items-center space-x-2 px-3 py-1 rounded-full text-xs font-bold transition-all ${
-                    isListening 
-                    ? 'bg-red-100 text-red-600 animate-pulse border border-red-200' 
-                    : 'bg-indigo-50 text-indigo-600 hover:bg-indigo-100 border border-indigo-100'
-                  }`}
-                  title={isListening ? "Stop Listening" : "Voice Input"}
-                >
-                  <i className={`fa-solid ${isListening ? 'fa-stop' : 'fa-microphone'}`}></i>
-                  <span>{isListening ? 'Listening...' : 'Voice Input'}</span>
-                </button>
-              </div>
-            </div>
-            <textarea
-              className="w-full h-48 md:h-64 bg-transparent resize-none focus:outline-none text-lg text-slate-700 placeholder:text-slate-300"
-              placeholder={`Enter ${state.sourceLanguage} text...`}
-              value={state.sourceText}
-              onChange={(e) => setState(prev => ({ ...prev, sourceText: e.target.value }))}
-            />
-          </div>
-          <div className="p-6 bg-slate-50/50 flex flex-col">
-            <div className="flex items-center justify-between mb-2">
-              <label className="block text-xs font-bold text-slate-400 uppercase tracking-wider">Translation ({state.targetLanguage})</label>
-              
-              {state.translatedText && (
-                <div className="flex items-center space-x-2">
-                  <button
-                    onClick={handleGenerateGuide}
-                    className={`flex items-center space-x-2 px-3 py-1 rounded-full text-xs font-bold transition-all shadow-sm ${
-                      showGuide 
-                      ? 'bg-indigo-50 text-indigo-600 border border-indigo-200' 
-                      : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50'
-                    }`}
-                    title="Pronunciation Guide"
-                  >
-                    <i className="fa-solid fa-spell-check"></i>
-                    <span>Guide</span>
-                  </button>
-
-                  <button
-                    onClick={() => handleSpeak()}
-                    className={`flex items-center space-x-2 px-3 py-1 rounded-full text-xs font-bold transition-all shadow-sm ${
-                      isSpeaking 
-                      ? 'bg-indigo-600 text-white animate-pulse' 
-                      : 'bg-white text-indigo-600 border border-indigo-100 hover:bg-indigo-50'
-                    }`}
-                    title={isSpeaking ? "Stop Pronunciation" : "Listen to Translation"}
-                  >
-                    <i className={`fa-solid ${isSpeaking ? 'fa-stop' : 'fa-volume-high'}`}></i>
-                    <span>{isSpeaking ? 'Playing...' : 'Pronounce'}</span>
-                  </button>
-                </div>
-              )}
-            </div>
-            
-            <div className="flex-1 overflow-y-auto min-h-[120px] max-h-48 mb-4">
-              <div className="text-lg text-slate-800 leading-relaxed">
-                {state.translatedText || (
-                  <span className="text-slate-300 italic">Translation will appear here...</span>
-                )}
-              </div>
-            </div>
-
-            {showGuide && (
-              <div className="bg-indigo-50 border border-indigo-100 rounded-2xl p-4 animate-in fade-in slide-in-from-bottom-2 duration-300 shadow-sm mb-4">
-                <div className="flex items-center justify-between mb-3">
-                  <div className="flex items-center space-x-2">
-                    <div className="bg-indigo-600 text-white text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-tighter">
-                      Guide
-                    </div>
-                    <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">
-                      {state.targetLanguage === 'Chinese' ? 'Pinyin' : 
-                       state.targetLanguage === 'Japanese' ? 'Romaji' : 
-                       state.targetLanguage === 'Korean' ? 'Romanization' : 'Phonetic IPA'}
-                    </span>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    {state.pronunciationGuide && (
-                      <button 
-                        onClick={() => {
-                          navigator.clipboard.writeText(state.pronunciationGuide || '');
-                          const btn = document.getElementById('guide-copy-btn');
-                          if (btn) btn.innerHTML = '<i class="fa-solid fa-check"></i>';
-                          setTimeout(() => { if (btn) btn.innerHTML = '<i class="fa-regular fa-copy"></i>'; }, 2000);
-                        }}
-                        id="guide-copy-btn"
-                        className="text-[10px] text-indigo-400 hover:text-indigo-600 transition-colors bg-white w-6 h-6 rounded-full flex items-center justify-center border border-indigo-50 shadow-sm"
-                        title="Copy Guide"
-                      >
-                        <i className="fa-regular fa-copy"></i>
-                      </button>
-                    )}
-                    <button 
-                      onClick={() => setShowGuide(false)}
-                      className="text-indigo-300 hover:text-indigo-500 transition-colors"
-                    >
-                      <i className="fa-solid fa-xmark text-xs"></i>
-                    </button>
-                  </div>
-                </div>
-                <div className="font-mono text-indigo-800 text-sm leading-relaxed bg-white/50 p-3 rounded-xl border border-indigo-50/50">
-                  {isGeneratingGuide ? (
-                    <div className="flex items-center space-x-3 text-indigo-300 italic animate-pulse">
-                      <i className="fa-solid fa-wand-sparkles fa-spin text-xs"></i>
-                      <span>Synthesizing guide...</span>
-                    </div>
-                  ) : (
-                    state.pronunciationGuide || <span className="text-indigo-200">No guide generated.</span>
-                  )}
+            {isAutoDetect && (lastDetectedLanguage || isDetecting) && !isLiveMode && (
+              <div className="absolute -top-7 left-0 animate-in slide-in-from-bottom-2 duration-300">
+                <div className="flex items-center space-x-1.5 bg-indigo-600/95 backdrop-blur-sm text-white text-[9px] font-black px-2 py-0.5 rounded shadow-lg uppercase tracking-wider">
+                  {isDetecting ? <i className="fa-solid fa-wand-magic-sparkles animate-pulse"></i> : <i className="fa-solid fa-sparkles"></i>}
+                  <span>{isDetecting ? 'Analyzing...' : `Detected: ${lastDetectedLanguage}`}</span>
+                  {!isDetecting && <button onClick={handleCorrectDetection} className="ml-1.5 pl-1.5 border-l border-indigo-400 hover:text-indigo-200">Wrong?</button>}
                 </div>
               </div>
             )}
+          </div>
+          <button
+            onClick={() => { setIsAutoDetect(false); setState(prev => ({ ...prev, sourceLanguage: prev.targetLanguage, targetLanguage: prev.sourceLanguage })); }}
+            className="w-10 h-10 rounded-full hover:bg-indigo-50 text-slate-400 hover:text-indigo-600 transition-all flex items-center justify-center border border-slate-200 bg-white active:scale-90"
+          >
+            <i className="fa-solid fa-right-left text-xs"></i>
+          </button>
+          <select
+            value={state.targetLanguage}
+            onChange={(e) => setState(prev => ({ ...prev, targetLanguage: e.target.value as Language }))}
+            className="flex-1 bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-sm font-semibold focus:ring-2 focus:ring-indigo-500 outline-none cursor-pointer"
+          >
+            {ALL_LANGUAGES.map(lang => <option key={`trg-${lang}`} value={lang}>{lang}</option>)}
+          </select>
+        </div>
 
-            {state.error && (
-              <div className="mt-4 p-4 bg-red-50 text-red-600 rounded-xl text-sm flex items-start border border-red-100 animate-in shake duration-300">
-                <i className="fa-solid fa-circle-exclamation mr-3 mt-0.5 text-red-400"></i>
-                <div className="flex-1">
-                  <p className="font-bold mb-0.5">Translation Error</p>
-                  <p>{state.error}</p>
+        <div className="flex items-center space-x-2">
+          <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200">
+            <button onClick={() => setIsAutoDetect(true)} className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-tight transition-all flex items-center space-x-1.5 ${isAutoDetect ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
+              <i className="fa-solid fa-wand-sparkles"></i><span>Auto</span>
+            </button>
+            <button onClick={() => setIsAutoDetect(false)} className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-tight transition-all flex items-center space-x-1.5 ${!isAutoDetect ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
+              <i className="fa-solid fa-hand"></i><span>Manual</span>
+            </button>
+          </div>
+          <button onClick={() => setIsAutoPlayEnabled(!isAutoPlayEnabled)} className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all ${isAutoPlayEnabled ? 'bg-indigo-600 text-white shadow-inner' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
+            <i className={`fa-solid ${isAutoPlayEnabled ? 'fa-volume-high' : 'fa-volume-xmark'}`}></i>
+          </button>
+          <button onClick={() => setIsVoicePanelOpen(!isVoicePanelOpen)} className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all relative ${isVoicePanelOpen ? 'bg-indigo-600 text-white shadow-inner' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
+            <i className="fa-solid fa-sliders"></i>
+            {isAutoPlayEnabled && !isVoicePanelOpen && <span className="absolute top-1.5 right-1.5 w-1.5 h-1.5 bg-indigo-500 rounded-full border border-white"></span>}
+          </button>
+          <button onClick={() => setShowHistory(!showHistory)} className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all ${showHistory ? 'bg-indigo-600 text-white shadow-inner' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
+            <i className="fa-solid fa-clock-rotate-left"></i>
+          </button>
+        </div>
+      </div>
+
+      {isVoicePanelOpen && (
+        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-xl animate-in slide-in-from-top-2">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="space-y-2">
+              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Voice Profile</label>
+              <select value={selectedVoice} onChange={(e) => setSelectedVoice(e.target.value)} className="w-full bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-xs font-semibold">
+                {AVAILABLE_VOICES.map(v => <option key={v.id} value={v.id}>{v.label} ({v.desc})</option>)}
+              </select>
+            </div>
+            <div className="space-y-2">
+              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Speed: {speechRate}x</label>
+              <input type="range" min="0.5" max="2.0" step="0.1" value={speechRate} onChange={(e) => setSpeechRate(parseFloat(e.target.value))} className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600" />
+            </div>
+            <div className="flex items-center justify-center pt-2">
+              <label className="flex items-center space-x-3 cursor-pointer group">
+                <span className="text-xs text-slate-600 font-bold group-hover:text-indigo-600 transition-colors">Speak Automatically</span>
+                <input type="checkbox" checked={isAutoPlayEnabled} onChange={(e) => setIsAutoPlayEnabled(e.target.checked)} className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+              </label>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Source Panel */}
+        <div className={`bg-white rounded-3xl border shadow-sm overflow-hidden flex flex-col min-h-[420px] transition-all duration-500 ${isLiveMode ? 'border-indigo-500 shadow-indigo-100 ring-4 ring-indigo-500/10' : 'border-slate-200'}`}>
+          <div className="p-4 border-b flex items-center justify-between bg-slate-50/50">
+            <div className="flex items-center space-x-2">
+              <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">{state.sourceLanguage}</span>
+              {isLiveMode && (
+                <div className="flex items-center space-x-2 bg-indigo-100 px-2 py-0.5 rounded-full animate-pulse">
+                  <div className="w-1.5 h-1.5 bg-indigo-600 rounded-full"></div>
+                  <span className="text-[9px] font-black text-indigo-700 uppercase">Live Interpreter Active</span>
                 </div>
-                <button onClick={() => setState(prev => ({ ...prev, error: null }))} className="ml-2 text-red-400 hover:text-red-600 transition-colors">
-                  <i className="fa-solid fa-xmark"></i>
-                </button>
+              )}
+            </div>
+          </div>
+          <div className="flex-1 p-6 relative">
+            <textarea 
+              value={state.sourceText} 
+              onChange={(e) => setState(prev => ({ ...prev, sourceText: e.target.value }))} 
+              placeholder={isLiveMode ? "Speak now..." : "Enter text to translate..."} 
+              readOnly={isLiveMode}
+              className={`w-full h-full text-lg text-slate-800 placeholder:text-slate-300 resize-none outline-none bg-transparent leading-relaxed ${isLiveMode ? 'italic' : ''}`} 
+            />
+            {isLiveMode && (
+              <div className="absolute bottom-6 right-6 flex items-end space-x-1 h-8">
+                {[...Array(5)].map((_, i) => (
+                  <div key={i} className="w-1 bg-indigo-400 rounded-full transition-all duration-100" style={{ height: `${Math.max(20, Math.random() * micLevel)}%` }}></div>
+                ))}
               </div>
+            )}
+          </div>
+          <div className="p-4 bg-slate-50 border-t flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <button onClick={() => setState(prev => ({ ...prev, sourceText: '' }))} className="w-8 h-8 rounded-lg flex items-center justify-center text-slate-400 hover:text-red-500 transition-colors"><i className="fa-solid fa-trash-can text-sm"></i></button>
+              <button 
+                onClick={toggleLiveInterpreter} 
+                className={`flex items-center space-x-2 px-5 py-2 rounded-full text-xs font-black uppercase tracking-wider transition-all shadow-sm ${
+                  isLiveMode 
+                  ? 'bg-red-600 text-white animate-pulse hover:bg-red-700' 
+                  : 'bg-indigo-600 text-white hover:bg-indigo-700 hover:scale-105 active:scale-95'
+                }`}
+              >
+                <i className={`fa-solid ${isLiveMode ? 'fa-stop-circle' : 'fa-microphone-lines'}`}></i>
+                <span>{isLiveMode ? `Stop (${listeningTimeLeft}s)` : 'Live Interpreter'}</span>
+              </button>
+            </div>
+            {!isLiveMode && (
+              <button 
+                onClick={handleTranslate} 
+                disabled={state.isLoading || !state.sourceText.trim()} 
+                className="px-8 py-3 rounded-xl font-bold text-sm transition-all shadow-lg active:scale-95 disabled:opacity-50 flex items-center gradient-bg text-white"
+              >
+                {state.isLoading ? <i className="fa-solid fa-circle-notch fa-spin mr-2"></i> : <i className="fa-solid fa-language mr-2"></i>}
+                {splitIntoSentences(state.sourceText).length > 1 ? 'Translate All' : 'Translate'}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Output Panel */}
+        <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden flex flex-col min-h-[420px]">
+          <div className="p-4 border-b flex items-center justify-between bg-slate-50/50">
+            <div className="flex items-center space-x-2">
+              <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">{state.targetLanguage}</span>
+              {isSequentialMode && state.isLoading && (
+                 <span className="bg-indigo-600 text-white text-[9px] font-black px-2 py-0.5 rounded flex items-center space-x-1 animate-pulse">
+                  <i className="fa-solid fa-layer-group text-[7px]"></i><span>FAST CHUNKED MODE</span>
+                </span>
+              )}
+            </div>
+          </div>
+          
+          {isSequentialMode && state.isLoading && (
+            <div className="h-1 w-full bg-slate-100 overflow-hidden">
+              <div 
+                className="h-full gradient-bg transition-all duration-500 ease-out" 
+                style={{ width: `${progressPercent}%` }}
+              ></div>
+            </div>
+          )}
+
+          <div className="flex-1 p-6 overflow-y-auto">
+            {state.isLoading && isSequentialMode ? (
+               <div className="space-y-4 animate-in fade-in">
+                  <div className="flex items-center justify-between mb-4">
+                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
+                      Processing Sentences ({completedJobsCount}/{sentenceJobs.length})
+                    </p>
+                    <span className="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full">{Math.round(progressPercent)}% COMPLETE</span>
+                  </div>
+                  <div className="space-y-3">
+                    {sentenceJobs.map((job, idx) => (
+                      <div key={idx} className={`p-4 rounded-2xl border transition-all duration-300 ${
+                        job.status === 'translating' ? 'bg-indigo-50 border-indigo-100 shadow-sm scale-[1.01]' : 
+                        job.status === 'done' ? 'bg-slate-50 border-slate-100 opacity-80' : 
+                        job.status === 'error' ? 'bg-red-50 border-red-100' : 'bg-white border-transparent opacity-30'
+                      }`}>
+                        <div className="flex items-start justify-between">
+                          <p className="text-sm text-slate-700 font-medium line-clamp-2 pr-4">{job.source}</p>
+                          <div className="flex-shrink-0 mt-0.5">
+                            {job.status === 'translating' && <i className="fa-solid fa-circle-notch fa-spin text-indigo-500 text-xs"></i>}
+                            {job.status === 'done' && <i className="fa-solid fa-check-circle text-emerald-500 text-xs"></i>}
+                            {job.status === 'error' && <i className="fa-solid fa-circle-exclamation text-red-500 text-xs"></i>}
+                          </div>
+                        </div>
+                        {job.translated && (
+                          <p className="text-xs text-indigo-600 mt-2 pt-2 border-t border-indigo-100/50 italic font-medium animate-in slide-in-from-left-2">{job.translated}</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+               </div>
+            ) : (state.isLoading && !isSequentialMode) ? (
+               <div className="h-full flex flex-col items-center justify-center space-y-4">
+                 <div className="w-16 h-1 bg-slate-100 rounded-full overflow-hidden"><div className="w-full h-full gradient-bg animate-loading-bar"></div></div>
+                 <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Single Pass Translation...</p>
+               </div>
+            ) : state.translatedText ? (
+              <div className="space-y-6 animate-in fade-in duration-500">
+                <p className="text-2xl text-indigo-950 leading-relaxed font-medium tracking-tight whitespace-pre-wrap">{state.translatedText}</p>
+                {showGuide && (
+                  <div className="bg-indigo-50/50 p-5 rounded-2xl border border-indigo-100 animate-in slide-in-from-top-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center space-x-2"><span className="bg-indigo-600 text-white text-[9px] font-black px-2 py-0.5 rounded">IPA</span><span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">Phonetic Assist</span></div>
+                      <button onClick={() => setShowGuide(false)} className="text-indigo-300 hover:text-indigo-500"><i className="fa-solid fa-times text-xs"></i></button>
+                    </div>
+                    {isGeneratingGuide ? <div className="space-y-2"><div className="h-3 bg-indigo-100/50 rounded animate-pulse w-full"></div><div className="h-3 bg-indigo-100/50 rounded animate-pulse w-2/3"></div></div> : <p className="text-sm font-mono text-slate-600 italic">{state.pronunciationGuide || 'Guide unavailable'}</p>}
+                  </div>
+                )}
+              </div>
+            ) : state.error && !isOnline ? (
+              <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-6 animate-in zoom-in-95">
+                 <div className="w-20 h-20 bg-amber-50 text-amber-500 rounded-full flex items-center justify-center shadow-inner">
+                    <i className="fa-solid fa-book-open text-3xl"></i>
+                 </div>
+                 <div className="space-y-3">
+                   <h4 className="font-extrabold text-slate-800 text-lg">Translation Unavailable Offline</h4>
+                   <p className="text-sm text-slate-500 leading-relaxed max-w-xs mx-auto">{state.error}</p>
+                   <div className="bg-slate-50 p-4 rounded-xl border border-slate-100 text-left space-y-2 max-w-xs mx-auto">
+                      <p className="text-[10px] font-black uppercase text-slate-400 tracking-wider flex items-center">
+                        <i className="fa-solid fa-lightbulb mr-2 text-amber-500"></i>Next Steps
+                      </p>
+                      <ul className="text-xs text-slate-600 space-y-1.5 list-disc list-inside px-1">
+                        <li>Try shorter, basic words</li>
+                        <li>Check your network connection</li>
+                        <li>Switch to an online network for full AI power</li>
+                      </ul>
+                   </div>
+                 </div>
+                 {showOfflineSuggestions && (
+                   <div className="space-y-3 w-full animate-in fade-in slide-in-from-bottom-4">
+                      <p className="text-[10px] font-black text-indigo-500 uppercase tracking-widest">Try a Common Phrase</p>
+                      <div className="flex flex-wrap justify-center gap-2 max-w-md mx-auto">
+                        {getOfflineSuggestions().map(phrase => (
+                          <button 
+                            key={`suggest-${phrase}`} 
+                            onClick={() => { setState(prev => ({ ...prev, sourceText: phrase })); handleTranslate(); }}
+                            className="px-3 py-2 bg-white hover:bg-indigo-600 text-slate-600 hover:text-white rounded-xl text-xs font-bold border border-slate-200 shadow-sm transition-all active:scale-95"
+                          >
+                            {phrase}
+                          </button>
+                        ))}
+                      </div>
+                   </div>
+                 )}
+              </div>
+            ) : (
+              <div className="h-full flex flex-col items-center justify-center text-slate-200">
+                <i className="fa-solid fa-language text-6xl mb-4 opacity-10"></i>
+                <p className="text-sm font-bold tracking-widest uppercase text-slate-300">Awaiting input</p>
+              </div>
+            )}
+          </div>
+          
+          <div className="p-4 bg-slate-50 border-t flex items-center space-x-2">
+            {state.translatedText && !isLiveMode && (
+              <>
+                <button onClick={() => handleSpeak(state.translatedText)} disabled={!isOnline} className={`w-11 h-11 rounded-xl flex items-center justify-center transition-all ${isSpeaking ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white border border-slate-200 text-slate-500 hover:bg-slate-100'}`}><i className={`fa-solid ${isSpeaking ? 'fa-stop' : 'fa-volume-high'} text-lg`}></i></button>
+                <button onClick={handleGenerateGuide} disabled={!isOnline} className={`px-5 h-11 rounded-xl flex items-center justify-center space-x-2 transition-all border font-bold text-[10px] uppercase tracking-wider ${showGuide ? 'bg-indigo-50 border-indigo-200 text-indigo-600' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-100 shadow-sm'}`}><i className="fa-solid fa-spell-check text-xs"></i><span>How to Say</span></button>
+                <button onClick={() => navigator.clipboard.writeText(state.translatedText)} className="w-11 h-11 rounded-xl bg-white border border-slate-200 text-slate-500 hover:bg-slate-100 flex items-center justify-center transition-all"><i className="fa-solid fa-copy"></i></button>
+              </>
             )}
           </div>
         </div>
       </div>
 
-      {showHistory && (
-        <div className="fixed inset-0 z-50 flex justify-end">
-          <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" onClick={() => setShowHistory(false)}></div>
-          <div className="relative w-full max-w-md bg-white h-full shadow-2xl flex flex-col animate-in slide-in-from-right duration-300">
-            <div className="p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50">
-              <h3 className="text-xl font-bold text-slate-800 flex items-center">
-                <i className="fa-solid fa-clock-rotate-left mr-3 text-indigo-600"></i>
-                Recent Translations
-              </h3>
-              <button 
-                onClick={() => {
-                  setShowHistory(false);
-                  setHistorySearchQuery('');
-                }}
-                className="w-10 h-10 rounded-full hover:bg-slate-200 text-slate-400 transition-colors flex items-center justify-center"
-              >
-                <i className="fa-solid fa-xmark text-lg"></i>
-              </button>
-            </div>
-
-            <div className="px-6 py-4 border-b border-slate-100 bg-white">
-              <div className="relative group">
-                <i className="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-indigo-500 transition-colors"></i>
-                <input 
-                  type="text"
-                  placeholder="Search history..."
-                  value={historySearchQuery}
-                  onChange={(e) => setHistorySearchQuery(e.target.value)}
-                  className="w-full pl-10 pr-10 py-2 bg-slate-100 border-none rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all placeholder:text-slate-400"
-                />
-                {historySearchQuery && (
-                  <button 
-                    onClick={() => setHistorySearchQuery('')}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 transition-colors"
-                  >
-                    <i className="fa-solid fa-circle-xmark"></i>
-                  </button>
-                )}
-              </div>
-            </div>
-
-            <div className="flex-1 overflow-y-auto p-4 space-y-4">
-              {history.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-slate-300 space-y-4 py-20">
-                  <i className="fa-solid fa-folder-open text-5xl opacity-20"></i>
-                  <p className="text-center font-medium">No history yet</p>
-                  <p className="text-sm">Your translations will appear here.</p>
-                </div>
-              ) : filteredHistory.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-slate-300 space-y-4 py-20">
-                  <i className="fa-solid fa-magnifying-glass text-5xl opacity-20"></i>
-                  <p className="text-center font-medium">No matches found</p>
-                  <p className="text-sm">Try searching for something else.</p>
-                </div>
-              ) : (
-                filteredHistory.map((item) => (
-                  <div 
-                    key={item.id}
-                    onClick={() => selectHistoryItem(item)}
-                    className="group bg-white border border-slate-200 rounded-xl p-4 cursor-pointer hover:border-indigo-400 hover:shadow-md transition-all relative overflow-hidden"
-                  >
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center space-x-2 text-[10px] font-bold uppercase tracking-wider text-indigo-600">
-                        <span>{item.sourceLanguage}</span>
-                        <i className="fa-solid fa-arrow-right text-[8px] text-slate-300"></i>
-                        <span>{item.targetLanguage}</span>
-                      </div>
-                      <button 
-                        onClick={(e) => deleteHistoryItem(item.id, e)}
-                        className="opacity-0 group-hover:opacity-100 w-7 h-7 rounded-full bg-red-50 text-red-400 hover:bg-red-100 hover:text-red-600 transition-all flex items-center justify-center"
-                      >
-                        <i className="fa-solid fa-trash-can text-xs"></i>
-                      </button>
-                    </div>
-                    <p className="text-slate-700 text-sm line-clamp-2 font-medium mb-1">{item.sourceText}</p>
-                    <p className="text-slate-400 text-xs line-clamp-2 italic">{item.translatedText}</p>
-                    <div className="mt-2 text-[10px] text-slate-300">
-                      {new Date(item.timestamp).toLocaleString()}
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-
-            {history.length > 0 && (
-              <div className="p-4 border-t border-slate-100">
-                <button 
-                  onClick={clearHistory}
-                  className="w-full py-3 bg-slate-50 hover:bg-red-50 hover:text-red-600 text-slate-500 rounded-xl text-sm font-bold transition-all border border-slate-100 flex items-center justify-center space-x-2"
-                >
-                  <i className="fa-solid fa-trash-can"></i>
-                  <span>Clear All History</span>
-                </button>
-              </div>
-            )}
-          </div>
+      {state.error && isOnline && (
+        <div className="bg-red-50 border border-red-100 p-4 rounded-2xl flex items-start text-red-600 text-sm animate-in slide-in-from-top-1 shadow-sm">
+          <i className="fa-solid fa-triangle-exclamation mr-3 mt-1 text-red-400"></i>
+          <p className="flex-1 font-medium">{state.error}</p>
+          <button onClick={() => setState(prev => ({ ...prev, error: null }))} className="text-red-400 hover:text-red-600 ml-4 transition-colors"><i className="fa-solid fa-xmark"></i></button>
         </div>
       )}
     </div>
